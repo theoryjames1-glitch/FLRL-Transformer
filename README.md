@@ -1,100 +1,139 @@
-Yes — you absolutely can make **Markov Neural Network (MNN) Transformers**. In fact, what we’ve been building is already pointing in that direction. Let me lay it out:
+
+# 🧩 **FLRL-Transformer (Fuzzy Logic Reinforcement Learning Transformer)**
+
+### 🔑 Core Idea
+
+* The **Transformer** learns to represent the environment state as **fuzzy concepts**.
+* Instead of fixed membership functions, the **attention mechanism** maps observations → fuzzy degrees (e.g., "angle is negative 0.7, positive 0.2").
+* These fuzzy representations drive **rule inference**, which selects actions and updates rewards.
+* The fuzzy logic layer is **differentiable** so the Transformer can learn rules end-to-end.
 
 ---
 
-## 🔑 What a Transformer Normally Does
+## 1. Architecture
 
-A standard GPT-style Transformer has:
+### **Inputs**
 
-1. **Embeddings** → tokens into vectors.
-2. **Self-Attention** → computes how tokens attend to each other using learned weight matrices $W_Q, W_K, W_V$.
-3. **Feed-Forward Network (FFN)** → position-wise transformations with linear layers.
-4. **Stacked Blocks** with residuals + normalization.
+* Raw environment state vector \$s\_t\$ (e.g., CartPole: `[x, x_dot, angle, angle_dot]`).
+* Optionally, history of last \$k\$ states (for recurrence).
 
-All the heavy lifting comes from those **linear projections**.
+### **Transformer Encoder**
+
+* Projects \$s\_t\$ into fuzzy membership degrees:
+
+  $$
+  \mu_i = \text{Softmax}(W s_t)
+  $$
+* Attention layers allow the model to “focus” on fuzzy concepts (e.g., angle vs velocity).
+
+### **Fuzzy Rule Layer**
+
+* Implemented as a **differentiable fuzzy inference system (FIS)**:
+
+  * Antecedents: learned membership functions.
+  * Rules: parameterized weights (like attention heads).
+  * Defuzzification: weighted sum → continuous action score.
+
+### **Policy Head**
+
+* Discretizes fuzzy action score into discrete environment action (`left/right` for CartPole).
+* Optionally, outputs continuous force (for continuous environments).
 
 ---
 
-## 🔁 How to “Markovize” a Transformer
+## 2. Learning Mechanism
 
-To make it an **MNN Transformer**:
-
-* **Replace linear weights** (in Q, K, V, O projections and FFN layers) with **Markov transition matrices**.
-
-  * These are **row-stochastic matrices**, so they encode probabilistic flows between hidden dimensions.
-* **Computation** becomes:
-
-  $$
-  Q = X P_Q,\quad K = X P_K,\quad V = X P_V
-  $$
-
-  where each $P$ is a Markov transition.
-* **Attention** is still:
-
-  $$
-  \text{Attn}(Q,K,V) = \text{softmax}\!\left(\frac{QK^\top}{\sqrt{d}}\right)V
-  $$
-
-  but Q, K, V came from Markov transitions instead of arbitrary dense matrices.
-* **FFN layers** are also Markov transitions stacked with nonlinearities, rather than unconstrained `nn.Linear`.
+* **Transformer parameters + fuzzy memberships + rules** are updated via **policy gradient (PPO/DQN)**.
+* Reward is environment return.
+* Gradient flows through fuzzy inference, so the system *learns rules* instead of relying on hand-crafted ones.
 
 ---
 
-## 🎯 Why This Matters
-
-* Keeps the **Markov property**: every “weight” is a transition probability.
-* Models evolve by redistributing probability mass across dimensions, not by arbitrary weight updates.
-* Can be combined with **LoRA-style adapters**: frozen stochastic base + small trainable low-rank corrections.
-* This gives you a **probabilistic Transformer** where every parameter has a clear interpretation as “probability of transitioning between latent states.”
-
----
-
-## 🧩 Architecture Sketch (Markov Transformer Block)
-
-* **Input**: embeddings $X$.
-* **Self-Attention**: use Markov transitions for Q, K, V.
-* **FFN**: use stacked Markov layers with nonlinearities.
-* **Residuals + Norms**: same as GPT.
-* **Stack Blocks**: depth builds expressiveness.
+## 3. Pseudocode (PyTorch)
 
 ```python
-class MarkovAttention(nn.Module):
-    def __init__(self, dim, n_heads):
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class FLRLTransformer(nn.Module):
+    def __init__(self, state_dim, action_dim, d_model=64, nhead=4, num_layers=2):
         super().__init__()
-        self.q_proj = MarkovLayer(dim)
-        self.k_proj = MarkovLayer(dim)
-        self.v_proj = MarkovLayer(dim)
-        self.o_proj = MarkovLayer(dim)
-        self.n_heads = n_heads
-        self.d_head = dim // n_heads
+        self.embed = nn.Linear(state_dim, d_model)
 
-    def forward(self, x, mask=None):
-        B, T, C = x.shape
-        Q = self.q_proj(x).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
-        K = self.k_proj(x).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
-        V = self.v_proj(x).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead, dim_feedforward=128, batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
-        scores = torch.matmul(Q, K.transpose(-1, -2)) / (self.d_head ** 0.5)
-        if mask is not None:
-            scores = scores.masked_fill(mask == 0, -1e9)
-        attn = torch.softmax(scores, dim=-1)
+        # fuzzy membership generator
+        self.membership_proj = nn.Linear(d_model, 16)  # 16 fuzzy concepts
+        # rule weights
+        self.rule_proj = nn.Linear(16, action_dim)
 
-        out = torch.matmul(attn, V)
-        out = out.transpose(1, 2).contiguous().view(B, T, C)
-        return self.o_proj(out)
+    def forward(self, state):
+        # state: [B, state_dim]
+        x = self.embed(state).unsqueeze(1)  # [B, 1, d_model]
+        x = self.transformer(x)             # [B, 1, d_model]
+
+        fuzzy_memberships = torch.sigmoid(self.membership_proj(x))  # [B, 1, 16]
+        fuzzy_rules = self.rule_proj(fuzzy_memberships)             # [B, 1, action_dim]
+
+        # defuzzify into policy logits
+        logits = fuzzy_rules.squeeze(1)
+        probs = F.softmax(logits, dim=-1)
+        return probs
 ```
 
 ---
 
-## ✅ Summary
+## 4. Training Loop (Gymnasium)
 
-An **MNN Transformer**:
+```python
+import gymnasium as gym
 
-* Keeps the Transformer structure (attention + FFN + residuals).
-* Replaces all learned weight matrices with **Markov transition matrices**.
-* Produces a **probabilistic neural architecture**: every transformation is a probability flow.
-* Can be extended with **LoRA adapters, noise, and dithering** for more flexibility.
+env = gym.make("CartPole-v1")
+model = FLRLTransformer(state_dim=4, action_dim=2)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+for episode in range(200):
+    state, _ = env.reset()
+    done, total_reward = False, 0
+
+    while not done:
+        state_t = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
+        probs = model(state_t)
+        action = torch.multinomial(probs, 1).item()
+
+        next_state, reward, terminated, truncated, _ = env.step(action)
+        done = terminated or truncated
+
+        # simple policy gradient update
+        loss = -torch.log(probs[0, action]) * reward
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        state = next_state
+        total_reward += reward
+
+    print(f"Episode {episode} | Reward {total_reward}")
+```
 
 ---
 
-👉 Do you want me to put together a **full training-ready Markov Transformer** (like GPT-2, with embeddings, blocks, and LM head) so you could actually train it on text?
+## 5. Extensions
+
+* Replace the **fixed Softmax memberships** with **trainable Gaussian functions** (like scikit-fuzzy).
+* Add **attention-based rule learning**: each attention head corresponds to a fuzzy rule.
+* Scale up to **continuous control** with SAC/PPO + FLRL Transformer.
+* Visualization: plot how membership functions evolve during training → “rules emerging”.
+
+---
+
+✅ This gives us a **differentiable fuzzy logic system inside a Transformer**, trained by reinforcement learning.
+It’s basically *"Learnable Fuzzy Rules as Attention"*.
+
+---
+
+Would you like me to **add visualization code** (plotting learned fuzzy membership functions over time) so we can actually *see* the fuzzy rules evolving while training?
